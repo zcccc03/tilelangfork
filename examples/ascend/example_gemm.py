@@ -9,27 +9,66 @@ from tilelang.profiler import do_bench
 
 
 def gemm(
-    M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", out_dtype="float32", MIXED=None, hf32=None, enable_unit_flag=True, acc=False
+    M_DIM=8192,
+    K_DIM=8192,
+    N_DIM=8192,
+    dtype="bfloat16",
+    out_dtype="float32",
+    MIXED=None,
+    hf32=None,
+    enable_unit_flag=True,
+    acc=False,
+    *,
+    block_m=256,
+    block_n=256,
+    block_k=None,
+    num_blocks=32,
+    num_stages=2,
+    swizzle_window=4,
 ):
     """Persistent, auto-scheduled GEMM: C = X @ W.T.
 
     MIXED selects a vector-core epilogue (automatic for FP32 output from BF16/FP8).
     hf32 selects FP32 input rounding: None, nearest_zero or nearest_even.
     acc accumulates into a pre-initialized output via store-mode atomics.
+    Keyword-only tuning parameters control tile sizes, active cores, pipeline
+    depth and swizzle locality. Shapes must be divisible by the chosen tiles.
+    Tile/buffer capacities must be checked on the selected Ascend device.
     """
-    NUM_BLOCKS = 32
+    # Keep the baseline tile sizes by default; expose tuning knobs for
+    # different shapes/devices without changing the accumulation order silently.
+    for name, value in (
+        ("M", M_DIM),
+        ("N", N_DIM),
+        ("K", K_DIM),
+        ("block_m", block_m),
+        ("block_n", block_n),
+        ("num_blocks", num_blocks),
+        ("num_stages", num_stages),
+        ("swizzle_window", swizzle_window),
+    ):
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value}")
     is_fp32 = dtype == "float32"
     if MIXED is None:
         MIXED = not is_fp32 and out_dtype != "bfloat16"
-    TILE_M = 256
-    TILE_N = 256
-    TILE_K = 128 if is_fp32 else 256
+    TILE_M = block_m
+    TILE_N = block_n
+    TILE_K = (128 if is_fp32 else 256) if block_k is None else block_k
+    if not isinstance(TILE_K, int) or TILE_K <= 0:
+        raise ValueError(f"block_k must be a positive integer, got {TILE_K}")
+    if TILE_M % 16 or TILE_N % 16 or TILE_K % 32:
+        raise ValueError("block_m/block_n must be multiples of 16 and block_k of 32")
+    if M_DIM % TILE_M or N_DIM % TILE_N or K_DIM % TILE_K:
+        raise ValueError("M, N and K must be divisible by their tile sizes; tail tiles are unsupported")
     M_TILES = M_DIM // TILE_M
     N_TILES = N_DIM // TILE_N
     K_TILES = K_DIM // TILE_K
     OUT_TILES = M_TILES * N_TILES
-    WINDOW = min(4, M_TILES)
-    NUM_STAGES = 2
+    # Avoid launching idle cores for small output grids.
+    NUM_BLOCKS = min(num_blocks, OUT_TILES)
+    WINDOW = min(swizzle_window, M_TILES)
+    NUM_STAGES = min(num_stages, K_TILES)
     MAIN_ROW = M_TILES // WINDOW - 1
     TAIL_WIN = M_TILES - MAIN_ROW * WINDOW
     if enable_unit_flag:
@@ -43,7 +82,7 @@ def gemm(
     def aswt_swizzle(tile_idx):
         m_tile = T.alloc_var("int32")
         n_tile = T.alloc_var("int32")
-        row_idx = tile_idx // N_TILES // WINDOW
+        row_idx = T.min(tile_idx // N_TILES // WINDOW, MAIN_ROW)
         if row_idx < MAIN_ROW:
             m_tile = row_idx * WINDOW + tile_idx % WINDOW
             n_tile = tile_idx // WINDOW % N_TILES
@@ -63,7 +102,8 @@ def gemm(
             res = T.alloc_l0c((TILE_M, TILE_N), "float32")
             x_l1 = T.alloc_l1((TILE_M, TILE_K), dtype)
             w_l1 = T.alloc_l1((TILE_N, TILE_K), dtype)
-            temp = T.alloc_shared((TILE_M // 2, TILE_N), out_dtype)
+            if MIXED:
+                temp = T.alloc_shared((TILE_M // 2, TILE_N), out_dtype)
             if acc:
                 T.set_atomic("add", out_dtype)
             for tile_idx in T.Persistent([OUT_TILES], NUM_BLOCKS, bx):

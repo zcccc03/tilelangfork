@@ -46,3 +46,47 @@ def test_gemm_accumulate(out_dtype):
     kernel(a.npu(), b.npu(), output)
     expected = (a.float() @ b.float().T).to(initial.dtype) + initial
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"M_DIM": 257},
+        {"K_DIM": 129},
+        {"N_DIM": 0},
+        {"num_blocks": 0},
+        {"num_stages": 0},
+        {"swizzle_window": 0},
+        {"block_m": 17},
+        {"block_k": 0},
+    ],
+)
+def test_gemm_invalid_config(kwargs):
+    with pytest.raises(ValueError):
+        gemm(**kwargs)
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("stages", [1, 2])
+def test_gemm_tuned(mixed, stages):
+    # Non-full swizzle window and more tiles than cores exercise persistent reuse.
+    m, k, n = 640, 512, 384
+    a = (torch.randint(-4, 5, (m, k)).float() / 8).to(torch.bfloat16)
+    b = (torch.randint(-4, 5, (n, k)).float() / 8).to(torch.bfloat16)
+    kernel = tilelang.compile(
+        gemm(
+            m,
+            k,
+            n,
+            MIXED=mixed,
+            block_m=128,
+            block_n=128,
+            block_k=128,
+            num_blocks=8,
+            num_stages=stages,
+            swizzle_window=2,
+        ),
+        out_idx=-1,
+    )
+    torch.testing.assert_close(kernel(a.npu(), b.npu()).cpu(), a.float() @ b.float().T, rtol=0, atol=0)
