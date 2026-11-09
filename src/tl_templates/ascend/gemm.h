@@ -49,11 +49,15 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
 
   static_assert(K % TILE_K_SUB == 0, "K must be divisible by TILE_K_SUB");
   static_assert(TILE_K_SUB % C0 == 0, "TILE_K_SUB must be a multiple of C0");
-  static_assert(M % FRAC_N == 0, "M must be a multiple of 16");
+  constexpr bool GEMV = M == 1;
+  static_assert(GEMV || M % FRAC_N == 0, "M must be 1 (GEMV) or a multiple of 16");
+  static_assert(!GEMV || (sizeof(InT) == 2 && TILE_K_SUB % (FRAC_N * C0) == 0),
+                "GEMV requires 16-bit inputs and full 512B vector fractals");
   static_assert(N % FRAC_N == 0, "N must be a multiple of 16");
 
   constexpr int SUB_K = K / TILE_K_SUB;
-  constexpr int mStepA = M / FRAC_N;
+  constexpr int mStepA = GEMV ? 1 : M / FRAC_N;
+  constexpr int kStepA = GEMV ? TILE_K_SUB / (FRAC_N * C0) : TILE_K_SUB / C0;
   constexpr int mStepB = N / FRAC_N;
   constexpr int kStep = TILE_K_SUB / C0;
   constexpr int L0A_STAGE = M * TILE_K_SUB;
@@ -62,11 +66,32 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
   __ca__ InT *l0a = (__ca__ InT *)0;
   __cb__ InT *l0b = (__cb__ InT *)0;
 
+  if constexpr (GEMV) {
+    static_assert(TRANS_B, "L1 GEMV currently requires NT operands");
+    // Initial GEMV path deliberately uses a sequential sub-K pipeline. It
+    // owns no pre-seeded double-buffer locks and waits before reusing L0.
+    for (int sk = 0; sk < SUB_K; ++sk) {
+      asc_copy_l12l0a(l0a, cbuf_a_ptr, 0, sk * kStepA, 1, kStepA, 1, 1);
+      asc_copy_l12l0b(l0b, cbuf_b_ptr, 0, sk * kStep, mStepB, kStep,
+                     mStepB, mStepB);
+      asc_sync_notify(PIPE_MTE1, PIPE_M, static_cast<event_t>(0));
+      asc_sync_wait(PIPE_MTE1, PIPE_M, static_cast<event_t>(0));
+      const uint32_t uf = (unit_flag_ctrl == 3 && sk != SUB_K - 1)
+                              ? 2 : unit_flag_ctrl;
+      asc_mmad(cc_ptr, l0a, l0b, 1, TILE_K_SUB, N,
+               static_cast<asc_unit_flag_mode>(uf),
+               false, false, clear_accum && sk == 0);
+      asc_sync_notify(PIPE_M, PIPE_MTE1, static_cast<event_t>(0));
+      asc_sync_wait(PIPE_M, PIPE_MTE1, static_cast<event_t>(0));
+    }
+    return;
+  }
+
   for (int sk = 0; sk < SUB_K; ++sk) {
     // ASC_LOCK_BLOCK is the default lock mode; keep it explicit at call sites.
     asc_lock(PIPE_MTE1, buf_offset + (sk & 1), ASC_LOCK_BLOCK);
     asc_copy_l12l0a((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)), cbuf_a_ptr, 0,
-                    (sk * kStep), mStepA, kStep, mStepA, mStepA);
+                    (sk * kStepA), mStepA, kStepA, mStepA, mStepA);
     if constexpr (TRANS_B) {
       // NT case: W[N,K] in L1, cb transpose=false (ZZ)
       // rows=N, cols=K → sub-K along cols (kStart)
@@ -101,7 +126,7 @@ ascend_gemm_l1(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
 
     asc_mmad(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
              (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M, TILE_K_SUB, N,
-             uf_ctrl, true, false, clear_accum && is_first);
+             uf_ctrl, !GEMV, false, clear_accum && is_first);
     asc_unlock(PIPE_M, buf_offset + (sk & 1), ASC_LOCK_BLOCK);
   }
 }

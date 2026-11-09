@@ -48,7 +48,9 @@ def make_ascend_compact_nz_layout(buffer: BufferLikeType):
 
     This layout is intended for UB data that is produced directly in NZ order
     (for example with ``vsstb`` or a layout-driven ``T.copy``) and then copied
-    to L1. It is not an L1 Cube operand layout. For an ND-to-NZ ``T.copy``, the
+    to L1. The single-row FP16/BF16 case is also used as the contiguous L1 A
+    operand of hardware GEMV; other shapes are not L1 Cube operand layouts.
+    For an ND-to-NZ ``T.copy``, the
     allocation's row extent includes any desired padding, for example
     ``(tile_rows + 1, cols)``. Copy only the valid region with
     ``T.copy(src, dst[:tile_rows, :])``; gap rows are not initialized.

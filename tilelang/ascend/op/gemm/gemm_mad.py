@@ -5,6 +5,7 @@ from tilelang.ascend import language as T
 from tilelang.layout import (
     make_ascend_major_k_layout,
     make_ascend_major_mn_layout,
+    make_ascend_compact_nz_layout,
     try_extract_fractal_layout,
 )
 from tilelang.transform.simplify import _Simplify
@@ -91,6 +92,21 @@ _ASCEND_DTYPE_MAP = {
 
 class GemmMAD(GemmBase):
     @property
+    def is_l1_gemv(self) -> bool:
+        """M=1 NT L1 inputs use the compact vector hardware GEMV path."""
+        return self._is_l1_input() and self.M == 1 and not self.is_blockscaled
+
+    def _check_l1_gemv(self):
+        if not self.is_l1_gemv:
+            return
+        assert not self.trans_A and self.trans_B, "Ascend L1 GEMV requires NT operands"
+        assert self._input_dtype() in ("float16", "bfloat16"), "L1 GEMV currently supports FP16/BF16 inputs"
+        assert self.K % 256 == 0, "L1 GEMV requires K divisible by 256 (512-byte vector fractals)"
+        assert self.N % 16 == 0, "L1 GEMV requires N divisible by 16"
+        assert len(self.A.shape) == 2 and self.A.shape[0] == 1, "L1 GEMV A must be a compact [1,K] allocation"
+        assert all(arith.Analyzer().can_prove_equal(r.min, 0) for r in self.ARegion.region), "L1 GEMV A region must start at zero"
+
+    @property
     def is_blockscaled(self) -> bool:
         # Structural, matching the C++ node hierarchy: explicit SFA/SFB
         # operands build a tl.tileop.gemm_blockscaled op handled by
@@ -118,6 +134,7 @@ class GemmMAD(GemmBase):
 
     def infer_layout(self, target: Target, thread_nums: int):
         self._check_blockscaled_k_alignment()
+        self._check_l1_gemv()
         layouts = {}
         # Choose K-major vs MN-major so that each operand's reduce-K axis lands
         # on the C0 axis. Both regular and blockscaled GEMM use the transpose
@@ -128,6 +145,8 @@ class GemmMAD(GemmBase):
         k_align = 64 if self.is_blockscaled else 1
 
         def _a_layout(buf):
+            if self.is_l1_gemv:
+                return make_ascend_compact_nz_layout(buf)
             return make_ascend_major_mn_layout(buf, k_align=k_align) if self.trans_A else make_ascend_major_k_layout(buf, k_align=k_align)
 
         def _b_layout(buf):
@@ -140,6 +159,7 @@ class GemmMAD(GemmBase):
 
     def _prepare_lower(self, layout_map: dict) -> None:
         self._check_blockscaled_k_alignment()
+        self._check_l1_gemv()
         self._layout_map = layout_map
 
         if self.C is not None:
@@ -214,6 +234,13 @@ class GemmMAD(GemmBase):
         max_k_a = l0_per_stage * 8 // (self.M * elem_bits)
         max_k_b = l0_per_stage * 8 // (self.N * elem_bits)
         max_k = min(max_k_a, max_k_b, self.K)
+        if self.is_l1_gemv:
+            # A is loaded in complete 512B vector fractals, not row-padded NZ.
+            tile_k_sub = (max_k // 256) * 256
+            while tile_k_sub > 0 and self.K % tile_k_sub:
+                tile_k_sub -= 256
+            assert tile_k_sub > 0, "L1 GEMV cannot fit a 256-element K tile in L0"
+            return tile_k_sub
         tile_k_sub = (max_k // c0) * c0
         assert tile_k_sub > 0, f"Cannot fit any sub-K tile in L0: M={self.M}, N={self.N}, dtype={input_dtype}, L0 capacity={l0_capacity}"
         while self.K % tile_k_sub != 0 and tile_k_sub > c0:

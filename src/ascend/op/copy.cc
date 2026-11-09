@@ -557,16 +557,26 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
 
     AscendFractalLayoutInfo dst_layout;
     bool has_dst_layout = false;
+    bool is_gemv_vector = false;
     if (auto layout = FindLayoutForBuffer(T.layout_map, op.dst)) {
+      // M=1 GEMV stores A as consecutive 32B groups, with no 16-row NZ
+      // padding. Its compact layout is valid in L1 only for a single row.
+      is_gemv_vector = op.dst->shape.size() == 2 &&
+                       analyzer->CanProveEqual(op.dst->shape[0], 1) &&
+                       (op.dst->dtype.is_float16() || op.dst->dtype.is_bfloat16()) &&
+                       IsAscendCompactNZLayout(layout.value(), op.dst);
       has_dst_layout =
-          TryExtractAscendFractalLayout(layout.value(), op.dst, &dst_layout);
-      ICHECK(has_dst_layout)
+          !is_gemv_vector && TryExtractAscendFractalLayout(layout.value(), op.dst, &dst_layout);
+      ICHECK(has_dst_layout || is_gemv_vector)
           << "GM->L1 copy expects an Ascend fractal layout on the L1 dst "
           << op.dst->name;
     }
     bool needs_transpose = op.transpose != 0;
     PrimExpr dst_n_value;
-    if (has_dst_layout) {
+    if (is_gemv_vector) {
+      ICHECK(!needs_transpose) << "Compact L1 GEMV A copy cannot transpose";
+      dst_n_value = I(1);
+    } else if (has_dst_layout) {
       if (dst_layout.kind == AscendFractalKind::kSF) {
         needs_transpose = !needs_transpose;
         dst_n_value = dst_layout.outer1;
