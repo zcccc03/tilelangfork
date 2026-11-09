@@ -128,8 +128,11 @@ def ref_program(x, w, c=None, out_dtype="float32"):
     return out if c is None else out + c
 
 
-def run_regression_perf(M=8192, K=8192, N=8192, dtype="bfloat16", hf32=None, target=None, out_dtype="float32", acc=False):
-    program = gemm(M, K, N, dtype=dtype, out_dtype=out_dtype, hf32=hf32, acc=acc)
+def run_regression_perf(M=8192, K=8192, N=8192, dtype="bfloat16", hf32=None, target=None, out_dtype="float32", acc=False, **kernel_config):
+    # A persistent block runs many tiles; over-launching can leave a long tail.
+    if "num_blocks" not in kernel_config:
+        kernel_config["num_blocks"] = torch.npu.get_device_properties(torch.npu.current_device()).cube_core_num
+    program = gemm(M, K, N, dtype=dtype, out_dtype=out_dtype, hf32=hf32, acc=acc, **kernel_config)
     kernel = tilelang.compile(program, target=target, out_idx=None if acc else -1)
     a = torch.randn(M, K, device="npu").to(getattr(torch, dtype))
     b = torch.randn(N, K, device="npu").to(getattr(torch, dtype))
@@ -137,14 +140,23 @@ def run_regression_perf(M=8192, K=8192, N=8192, dtype="bfloat16", hf32=None, tar
     repeats = 100 if dtype == "bfloat16" else 50
     latency = do_bench(lambda: kernel(*inputs), backend="msprof", _n_warmup=30, _n_repeat=repeats)
     tflops = 2.0 * M * N * K / (latency * 1e9)
-    print(f"gemm (M={M}, N={N}, K={K}, {dtype}, out={out_dtype}, hf32={hf32}, acc={acc}): {latency * 1000:.2f} us | {tflops:.1f} TFLOPS")
+    print(
+        f"gemm (M={M}, N={N}, K={K}, {dtype}, out={out_dtype}, hf32={hf32}, acc={acc}, blocks={kernel_config['num_blocks']}): {latency * 1000:.2f} us | {tflops:.1f} TFLOPS"
+    )
     return latency
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bench", action=argparse.BooleanOptionalAction, default=True, help="benchmark after correctness checks")
+    parser.add_argument("--num-blocks", type=int, default=None, help="persistent blocks (default: device Cube core count)")
     args = parser.parse_args()
+    num_blocks = (
+        args.num_blocks if args.num_blocks is not None else torch.npu.get_device_properties(torch.npu.current_device()).cube_core_num
+    )
+    if num_blocks <= 0:
+        parser.error("--num-blocks must be positive")
+    print(f"Persistent GEMM blocks: {num_blocks}")
     M, K, N = 8192, 8192, 8192
     # dtype, output dtype, HF32 rounding, accumulation, maximum absolute error
     cases = [
@@ -160,7 +172,7 @@ if __name__ == "__main__":
         a = torch.randn(M, K, device="npu").to(getattr(torch, dtype))
         b = torch.randn(N, K, device="npu").to(getattr(torch, dtype))
         initial = torch.randn(M, N, device="npu", dtype=getattr(torch, out_dtype)) if acc else None
-        program = gemm(M, K, N, dtype=dtype, out_dtype=out_dtype, hf32=hf32, acc=acc)
+        program = gemm(M, K, N, dtype=dtype, out_dtype=out_dtype, hf32=hf32, acc=acc, num_blocks=num_blocks)
         kernel = tilelang.compile(program, out_idx=None if acc else -1)
         if acc:
             result = initial.clone()
@@ -172,4 +184,4 @@ if __name__ == "__main__":
         assert max_diff < tolerance, f"max_diff={max_diff:.2e}, tolerance={tolerance:.2e}"
         print(f"gemm ({dtype}, out={out_dtype}, hf32={hf32}, acc={acc}): correctness passed")
         if args.bench:
-            run_regression_perf(dtype=dtype, out_dtype=out_dtype, hf32=hf32, acc=acc)
+            run_regression_perf(dtype=dtype, out_dtype=out_dtype, hf32=hf32, acc=acc, num_blocks=num_blocks)
