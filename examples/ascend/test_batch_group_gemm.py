@@ -13,6 +13,8 @@ from example_group_gemm import group_gemm, make_group_offsets, ref_program as gr
 @pytest.mark.parametrize(
     "dtype,out_dtype,mixed,hf32,acc",
     [
+        ("float16", "float32", False, None, False),
+        ("float16", "float32", True, None, False),
         ("bfloat16", "float32", False, None, False),
         ("float8_e4m3fn", "float32", True, None, False),
         ("float32", "float32", False, "nearest_even", False),
@@ -81,3 +83,33 @@ def test_group_offsets_invalid(sizes):
 
 def test_group_offsets_empty_groups():
     assert make_group_offsets([0, 256, 0, 512, 0]).tolist() == [0, 0, 256, 256, 768, 768]
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize("kind", ["batch", "group"])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("prefetch_k", [False, True])
+@pytest.mark.parametrize("k", [256, 768])
+def test_fp16_rectangular_tiles(kind, mixed, prefetch_k, k):
+    config = dict(dtype="float16", block_m=128, block_n=256, block_k=256, num_blocks=2, MIXED=mixed, prefetch_k=prefetch_k)
+    generator = torch.Generator().manual_seed(7)
+    if kind == "batch":
+        a_shape, b_shape = (3, 128, k), (3, 256, k)
+        program = batch_gemm(3, 128, k, 256, **config)
+    else:
+        offsets = make_group_offsets([0, 128, 256, 0], 128)
+        a_shape, b_shape = (384, k), (4, 256, k)
+        program = group_gemm(4, 384, k, 256, **config)
+    a = (torch.randint(-4, 5, a_shape, generator=generator).float() / 8).half()
+    b = (torch.randint(-4, 5, b_shape, generator=generator).float() / 8).half()
+    expected = batch_ref(a, b) if kind == "batch" else group_ref(a, b, offsets)
+    kernel = tilelang.compile(program, out_idx=-1 if kind == "batch" else 2)
+    result = kernel(a.npu(), b.npu(), *(() if kind == "batch" else (offsets.npu(),)))
+    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("factory", [batch_gemm, group_gemm])
+@pytest.mark.parametrize("config", [{"dtype": "bfloat16"}, {"block_k": 512}, {"num_stages": 1}, {"acc": True}])
+def test_prefetch_invalid_config(factory, config):
+    with pytest.raises(ValueError):
+        factory(prefetch_k=True, **config)
