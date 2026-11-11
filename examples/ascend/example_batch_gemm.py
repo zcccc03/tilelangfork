@@ -9,18 +9,18 @@ from tilelang.profiler import do_bench
 
 
 def batch_gemm(
-    B_DIM=4,
-    M_DIM=1024,
-    K_DIM=1024,
-    N_DIM=1024,
+    B_DIM=28,
+    M_DIM=512,
+    K_DIM=512,
+    N_DIM=512,
     dtype="float16",
     out_dtype="float32",
-    MIXED=None,
+    MIXED=False,
     hf32=None,
     enable_unit_flag=True,
     acc=False,
     *,
-    block_m=128,
+    block_m=256,
     block_n=256,
     block_k=None,
     num_blocks=28,
@@ -36,8 +36,8 @@ def batch_gemm(
     Keyword-only tuning parameters control tile sizes, active cores, pipeline
     depth and swizzle locality. Shapes must be divisible by the chosen tiles.
     Tile/buffer capacities must be checked on the selected Ascend device.
-    The default 128x256 tile is tuned for FP16, B=4 and M=N=K=1024 on 28 cores.
-    Use block_m=256 to reproduce the original tile configuration.
+    The default workload uses 28 batches of 512x512x512 FP16 GEMM on 28 Cube cores.
+    It uses 256x256 output tiles and stores FP32 results directly from Cube.
     prefetch_k is an opt-in two-step K prefetch for FP16-to-FP32 overwrite.
     It keeps two L1 slots, falls back for one K tile, and does not tune outputs.
     """
@@ -168,10 +168,9 @@ def ref_program(x, w, c=None, out_dtype="float32"):
 
 
 def run_regression_perf(
-    B=4, M=1024, K=1024, N=1024, dtype="float16", out_dtype="float32", hf32=None, acc=False, target=None, **kernel_config
+    B=28, M=512, K=512, N=512, dtype="float16", out_dtype="float32", hf32=None, acc=False, target=None, **kernel_config
 ):
-    if "num_blocks" not in kernel_config:
-        kernel_config["num_blocks"] = torch.npu.get_device_properties(torch.npu.current_device()).cube_core_num
+    kernel_config.setdefault("num_blocks", 28)
     program = batch_gemm(B, M, K, N, dtype=dtype, out_dtype=out_dtype, hf32=hf32, acc=acc, **kernel_config)
     kernel = tilelang.compile(program, target=target, out_idx=None if acc else -1)
     a = torch.randn(B, M, K).to(getattr(torch, dtype)).npu()
@@ -189,19 +188,19 @@ def run_regression_perf(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bench", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--num-blocks", type=int, default=None, help="default: device Cube core count")
-    parser.add_argument("--m", type=int, default=1024)
-    parser.add_argument("--n", type=int, default=1024)
-    parser.add_argument("--k", type=int, default=1024)
-    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument("--num-blocks", type=int, default=28, help="number of Cube cores to launch")
+    parser.add_argument("--m", type=int, default=512)
+    parser.add_argument("--n", type=int, default=512)
+    parser.add_argument("--k", type=int, default=512)
+    parser.add_argument("--batch", type=int, default=28)
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float8_e4m3fn", "float32"], default="float16")
     parser.add_argument("--all-dtypes", action="store_true", help="opt in to precision/accumulation regression cases")
-    parser.add_argument("--block-m", type=int, default=128)
+    parser.add_argument("--block-m", type=int, default=256)
     parser.add_argument("--block-n", type=int, default=256)
     parser.add_argument("--block-k", type=int, default=None)
     parser.add_argument("--num-stages", type=int, default=2)
     parser.add_argument("--swizzle-window", type=int, default=4)
-    parser.add_argument("--mixed", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--mixed", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--prefetch-k", action="store_true", help="opt-in FP16 K-load overlap (two L1 slots)")
     args = parser.parse_args()
     kernel_config = dict(
@@ -212,9 +211,7 @@ if __name__ == "__main__":
         swizzle_window=args.swizzle_window,
         MIXED=args.mixed,
     )
-    num_blocks = (
-        args.num_blocks if args.num_blocks is not None else torch.npu.get_device_properties(torch.npu.current_device()).cube_core_num
-    )
+    num_blocks = args.num_blocks
     if num_blocks <= 0:
         parser.error("--num-blocks must be positive")
     M, K, N = args.m, args.k, args.n
