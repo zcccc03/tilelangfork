@@ -12,8 +12,8 @@ def gemv_28core(n=1792, k=6144, tile_n=64, tile_k=768, buffers=2):
     cores = 28
     if min(n, k, tile_n, tile_k) <= 0 or tile_n % 16 or tile_k % 256:
         raise ValueError("Positive tiles must align N to 16 and K to 256")
-    if n % (cores * tile_n) or k % tile_k:
-        raise ValueError("Use equal work on 28 cores and no K tails")
+    if n % tile_n or k % tile_k:
+        raise ValueError("N and K must be divisible by their tile sizes (no tails)")
     if buffers not in (1, 2, 4) or k // tile_k < buffers:
         raise ValueError("Use 1, 2 or 4 buffers and at least that many K tiles")
     if buffers * 2 * (tile_n + 1) * tile_k > 512 * 1024:
@@ -30,16 +30,21 @@ def gemv_28core(n=1792, k=6144, tile_n=64, tile_k=768, buffers=2):
             acc = T.alloc_l0c((1, tile_n), "float32")
             # Each in-flight K tile owns one X slot and one W slot in L1.
             # Keep one FP32 accumulator for all K tiles of this output block.
-            T.annotate_buffer_versions({x: buffers, w: buffers})
+            if buffers > 1:
+                T.annotate_buffer_versions({x: buffers, w: buffers})
             for nt in T.Persistent([n // tile_n], cores, bx):
-                for kt in T.Pipelined(k_tiles, num_stages=buffers, annotations={"enable_offset": buffers > 1}):
-                    with T.Stage(0):
+                if buffers == 1:
+                    for kt in T.serial(k_tiles):
                         T.copy(X[0:1, kt * tile_k : (kt + 1) * tile_k], x)
                         T.copy(W[nt * tile_n : (nt + 1) * tile_n, kt * tile_k : (kt + 1) * tile_k], w)
-                    with T.Stage(2):
-                        # The backend releases the L1 slot after this tile's
-                        # sequential L1->L0->MMAD work finishes.
                         T.gemm(x, w, acc, transpose_B=True, clear_accum=kt == 0)
+                else:
+                    for kt in T.Pipelined(k_tiles, num_stages=buffers, annotations={"enable_offset": True}):
+                        with T.Stage(0):
+                            T.copy(X[0:1, kt * tile_k : (kt + 1) * tile_k], x)
+                            T.copy(W[nt * tile_n : (nt + 1) * tile_n, kt * tile_k : (kt + 1) * tile_k], w)
+                        with T.Stage(2):
+                            T.gemm(x, w, acc, transpose_B=True, clear_accum=kt == 0)
                 T.copy(acc, Y[0:1, nt * tile_n : (nt + 1) * tile_n])
 
     return main
