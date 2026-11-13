@@ -88,8 +88,8 @@ std::vector<Stmt> MakeL1PaddingStmts(const AscendCopyNode *copy,
   Optional<Layout> layout = ascend::FindLayoutForBuffer(layout_map, copy->dst);
   if (!layout.defined())
     return stmts;
-  if (copy->dst->shape.size() == 2 &&
-      analyzer->CanProveEqual(copy->dst->shape[0], 1) &&
+  if (copy->dst->shape.size() >= 2 &&
+      analyzer->CanProveEqual(copy->dst->shape[copy->dst->shape.size() - 2], 1) &&
       IsAscendCompactNZLayout(layout.value(), copy->dst)) {
     // Hardware GEMV A has no padded NZ rows. Tail padding would change its
     // compact vector representation; the initial path accepts in-bounds DMA.

@@ -250,7 +250,19 @@ bool IsAscendCompactNZLayout(const Layout &layout, const Buffer &buffer) {
   if (cols == nullptr || *cols % AscendC0(bits) != 0)
     return false;
   Layout expected = MakeAscendCompactNZLayout(buffer);
-  return layout->IsEqual(expected.get());
+  if (layout->IsEqual(expected.get()))
+    return true;
+  // MaterializeMultiBuffer prepends separate slot axes to the inferred
+  // two-dimensional compact layout, instead of folding them into C0 groups.
+  if (buffer->shape.size() <= 2 || !is_one(buffer->shape[buffer->shape.size() - 2]))
+    return false;
+  size_t leading = buffer->shape.size() - 2;
+  Array<PrimExpr> slots;
+  for (size_t i = 0; i < leading; ++i)
+    slots.push_back(buffer->shape[i]);
+  Buffer tile = buffer;
+  tile.CopyOnWrite()->shape = {buffer->shape[leading], buffer->shape[leading + 1]};
+  return layout->IsEqual(MakeAscendCompactNZLayout(tile)->Expand(slots).get());
 }
 
 static Layout MakeAscendL0CLayout2D(PrimExpr rows, PrimExpr cols) {

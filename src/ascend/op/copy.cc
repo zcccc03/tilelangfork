@@ -561,8 +561,8 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
     if (auto layout = FindLayoutForBuffer(T.layout_map, op.dst)) {
       // M=1 GEMV stores A as consecutive 32B groups, with no 16-row NZ
       // padding. Its compact layout is valid in L1 only for a single row.
-      is_gemv_vector = op.dst->shape.size() == 2 &&
-                       analyzer->CanProveEqual(op.dst->shape[0], 1) &&
+      is_gemv_vector = op.dst->shape.size() >= 2 &&
+                       analyzer->CanProveEqual(op.dst->shape[op.dst->shape.size() - 2], 1) &&
                        (op.dst->dtype.is_float16() || op.dst->dtype.is_bfloat16()) &&
                        IsAscendCompactNZLayout(layout.value(), op.dst);
       has_dst_layout =

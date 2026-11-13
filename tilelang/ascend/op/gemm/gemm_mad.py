@@ -103,8 +103,11 @@ class GemmMAD(GemmBase):
         assert self._input_dtype() in ("float16", "bfloat16"), "L1 GEMV currently supports FP16/BF16 inputs"
         assert self.K % 256 == 0, "L1 GEMV requires K divisible by 256 (512-byte vector fractals)"
         assert self.N % 16 == 0, "L1 GEMV requires N divisible by 16"
-        assert len(self.A.shape) == 2 and self.A.shape[0] == 1, "L1 GEMV A must be a compact [1,K] allocation"
-        assert all(arith.Analyzer().can_prove_equal(r.min, 0) for r in self.ARegion.region), "L1 GEMV A region must start at zero"
+        assert len(self.A.shape) >= 2 and self.A.shape[-2] == 1, "L1 GEMV A must have a compact [1,K] tile"
+        analyzer = arith.Analyzer()
+        # A pipeline can prepend physical slot axes after layout inference.
+        assert all(analyzer.can_prove_equal(r.extent, 1) for r in self.ARegion.region[:-2]), "L1 GEMV must use one slot"
+        assert all(analyzer.can_prove_equal(r.min, 0) for r in self.ARegion.region[-2:]), "L1 GEMV A tile must start at zero"
 
     @property
     def is_blockscaled(self) -> bool:
