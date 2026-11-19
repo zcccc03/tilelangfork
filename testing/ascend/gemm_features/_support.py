@@ -5,7 +5,7 @@ The optional failure directory is used only for FAIL, never for PASS or SKIP.
 """
 
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 import inspect
 import json
@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import traceback
+from types import SimpleNamespace
 
 import torch
 import tilelang
@@ -65,6 +66,83 @@ def options(parser):
 
 def make_options(args):
     return Options(args.mode, args.device, args.failure_dir)
+
+
+def parse_options(case):
+    return make_options(options(argparse.ArgumentParser(description=case.scenario)).parse_args())
+
+
+def exit_code(row):
+    return 0 if row["status"] in {"PASS", "OBSERVED"} else 1 if row["status"] == "FAIL" else 2
+
+
+def assert_result(row):
+    import pytest
+
+    if row["status"] in {"SKIP", "COMPILE_ONLY"}:
+        pytest.skip(row["actual"])
+    assert row["status"] in {"PASS", "OBSERVED"}, json.dumps(row, ensure_ascii=False)
+
+
+def compiled_ir(kernel, program, case):
+    artifact = kernel.artifact
+    if artifact is None:
+        context = (
+            tilelang.tvm.transform.PassContext(opt_level=3, config={tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False})
+            if case.manual_schedule
+            else nullcontext()
+        )
+        with context:
+            artifact = tilelang.lower(program, target="ascend", enable_host_codegen=False, enable_device_compile=False)
+    return artifact.device_mod.script()
+
+
+@contextmanager
+def record_case(case, make_kernel, config):
+    """Capture results/failure files; each file's main owns compile, launch and CPU comparison."""
+    print("[用例说明] " + json.dumps(asdict(case), ensure_ascii=False), flush=True)
+    record = SimpleNamespace(
+        phase="frontend",
+        evidence={},
+        row={
+            "id": case.id,
+            "feature": case.feature,
+            "scenario": case.scenario,
+            "responsibility": case.responsibility,
+            "mode": config.mode,
+            "expected": case.expected,
+        },
+    )
+    try:
+        yield record
+    except Exception as error:
+        details, message = traceback.format_exc(), str(error)
+        if (
+            case.kind in {"reject", "caller"}
+            and record.phase in {"frontend", "compile"}
+            and case.diagnostic
+            and re.search(case.diagnostic, message, re.IGNORECASE)
+            and not isinstance(error, (FileNotFoundError, subprocess.TimeoutExpired))
+        ):
+            record.row.update(
+                status="OBSERVED" if case.kind == "caller" else "PASS",
+                level=record.phase.upper(),
+                actual="目标约束已拦截" if case.kind == "reject" else "编译器提供了额外静态防护；范围仍由调用方保证",
+                diagnostic=message,
+            )
+            print("[编译诊断]\n" + message, flush=True)
+        else:
+            record.row.update(status="FAIL", level=record.phase.upper(), actual=message)
+            if "\nSource:\n" in message:
+                record.evidence["kernel.asc"] = message.split("\nSource:\n", 1)[1]
+            try:
+                failure_path = save_failure(case, make_kernel, record.evidence, config, details)
+                if failure_path:
+                    record.row["failure_path"] = failure_path
+            except OSError as logging_error:
+                record.row["logging_error"] = str(logging_error)
+    finally:
+        print("[第二部分：验收结果] " + json.dumps(record.row, ensure_ascii=False), flush=True)
 
 
 def compile_device(source, evidence):
@@ -135,29 +213,6 @@ def compare(case, actual, expected, evidence, launch):
     evidence[f"output_{launch}.pt"] = {"actual": actual, "expected": expected}
     torch.testing.assert_close(actual, expected, atol=case.atol, rtol=case.rtol)
     return (actual.double() - expected.double()).abs().max().item()
-
-
-def hardware(case, program, inputs, expected, initial, config, evidence):
-    try:
-        import torch_npu  # noqa: F401
-    except ImportError:
-        return None
-    if not torch.npu.is_available():
-        return None
-    torch.npu.set_device(config.device)
-    # Always pass an explicitly initialized GM output. Repeats test the same kernel.
-    configs = {tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False} if case.manual_schedule else None
-    kernel = tilelang.compile(program, target="ascend", out_idx=None, pass_configs=configs)
-    device_inputs = [value.npu() for value in inputs]
-    max_error = 0
-    for launch in range(1, case.repeats + 1):
-        output = (
-            initial if initial is not None else torch.full_like(expected, 0x12345678 if expected.dtype == torch.int32 else -12345)
-        ).npu()
-        kernel(*device_inputs, output)
-        torch.npu.synchronize()
-        max_error = max(max_error, compare(case, output.cpu(), expected, evidence, launch))
-    return max_error
 
 
 def save_failure(case, make_kernel, evidence, config, error):
@@ -247,7 +302,7 @@ def execute(case, make_kernel, make_reference, config=None, check_ir=None, check
 
                         error = simulate(case, program, source, inputs, expected, initial, evidence)
                     else:
-                        error = hardware(case, program, inputs, expected, initial, config, evidence)
+                        raise RuntimeError("真机数值请调用测试文件的 main()，由本文件直接编译、运行和验证")
                     if error is None:
                         row.update(status="SKIP", level="HARDWARE", actual="NPU 不可用；真机数值尚未验收")
                     else:
@@ -285,18 +340,3 @@ def execute(case, make_kernel, make_reference, config=None, check_ir=None, check
                 row["logging_error"] = str(logging_error)
     print("[第二部分：验收结果] " + json.dumps(row, ensure_ascii=False), flush=True)
     return row
-
-
-def pytest_case(case, make_kernel, make_reference, config, check_ir=None, check_source=None, lower_ir=None):
-    import pytest
-
-    row = execute(case, make_kernel, make_reference, config, check_ir, check_source, lower_ir)
-    if row["status"] in {"SKIP", "COMPILE_ONLY"}:
-        pytest.skip(row["actual"])
-    assert row["status"] in {"PASS", "OBSERVED"}, json.dumps(row, ensure_ascii=False)
-
-
-def standalone(case, make_kernel, make_reference, check_ir=None, check_source=None, lower_ir=None):
-    args = options(argparse.ArgumentParser(description=case.scenario)).parse_args()
-    row = execute(case, make_kernel, make_reference, make_options(args), check_ir, check_source, lower_ir)
-    return 0 if row["status"] in {"PASS", "OBSERVED"} else 1 if row["status"] == "FAIL" else 2

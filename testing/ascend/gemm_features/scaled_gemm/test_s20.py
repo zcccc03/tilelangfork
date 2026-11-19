@@ -24,7 +24,7 @@ import tilelang.ascend.language as T
 from tilelang import tvm
 from tvm import tirx
 from tilelang.layout import make_ascend_major_k_layout, make_ascend_l0c_layout
-from testing.ascend.gemm_features._support import Case, pytest_case, standalone
+from testing.ascend.gemm_features._support import Case, assert_result, execute, exit_code, parse_options
 
 SEED = 20261119
 CASE = Case(
@@ -93,9 +93,14 @@ def make_reference():
     return None
 
 
+def main(config=None):
+    config = config or parse_options(CASE)
+    return execute(CASE, make_kernel, make_reference, config)
+
+
 def test_case(gemm_options):
-    pytest_case(CASE, make_kernel, make_reference, gemm_options)
+    assert_result(main(gemm_options))
 
 
 if __name__ == "__main__":
-    raise SystemExit(standalone(CASE, make_kernel, make_reference))
+    raise SystemExit(exit_code(main()))

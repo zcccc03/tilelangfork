@@ -2,6 +2,16 @@
 
 本目录基于 origin/main 重新整理，测试源码直接位于原仓库 testing 下。每个二级特性一个目录，每个测试文件只有一个测试单元、一个固定场景。
 
+## main直接执行方式
+
+81个完整DSL用例在各自 `main()` 中直接调用 `tilelang.compile`，53个数值用例随后直接执行kernel并调用本地 `ref_program()` 验证CPU参考。普通输出采用 `out_idx=-1` 和 `result = kernel(*inputs)`；需要初值或保留GM哨兵时采用 `out_idx=None`、`result = initial.clone()`，将result传入kernel。所有数值用例报告max_diff，并沿用各场景原有的atol/rtol；INT32和要求零误差的场景保持精确比较。
+
+部分写回用例T01/T02/T14/T15/T43对GM外围哨兵另做零容差比较，不使用有效计算区的浮点容差放宽哨兵检查。
+
+`program.script()`打印输入TIR；实际编译源码由 `kernel.get_kernel_source()` 打印；另打印设备IR。约束负例直接检查编译异常，接受非法输入时FAIL，不启动非法指令。
+
+38个直接构造IR的局部场景保留pass单元测试入口。它们在原文件的参数节点以及新增T05-IR的具体命令见[原IR单元测试命令](IR_TEST_COMMANDS.md)。本次实际验证结果见[main直接执行版报告](DIRECT_MAIN_TEST_REPORT.md)。
+
 ## 开发人员直接执行
 
 在已经安装当前仓库 TileLang、PyTorch/torch_npu、CANN 的终端进入仓库根目录。不固定机器、驱动或软件版本；数值测试需要设备支持对应的数据类型与指令。

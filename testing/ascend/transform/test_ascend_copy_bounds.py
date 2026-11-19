@@ -181,12 +181,16 @@ def _mx_operand_copy(layout, actual_k, k_alloc=128, dtype="float8_e4m3fn", *, ex
 @pytest.mark.parametrize("explicit_task", [False, True], ids=["implicit-task", "explicit-task"])
 def test_mx_copy_pads_only_the_unwritten_k_tail(dtype, layout, actual_k, tail, explicit_task):
     before, l1 = _mx_operand_copy(layout, actual_k, dtype=dtype, explicit_task=explicit_task)
+    print(f"[场景] MX K尾部补零：{dtype=}, {layout=}, {actual_k=}, {explicit_task=}; 预期补零={tail}")
+    print("[第一部分：输入 IR]\n" + before.script())
     after = transform.AscendInsertOOBPadding()(before)
+    print("[补零后的 IR]\n" + after.script())
     fills = calls(after, "tl.tileop.fill")
     assert len(fills) == (tail is not None)
     tasks = [node for node in nodes(after, tirx.AttrStmt) if node.attr_key == "tl.ascend_task"]
     if tail is None:
         assert len(tasks) == int(explicit_task)
+        print("[第二部分：验收结果] IR correctness passed; no redundant fill")
         return
     (task,) = tasks
     assert [stmt.value.op.name for stmt in task.body.seq] == ["tl.tileop.ascend_copy", "tl.tileop.fill"]
@@ -207,12 +211,16 @@ def test_mx_copy_pads_only_the_unwritten_k_tail(dtype, layout, actual_k, tail, e
         return next(i for i, candidate in enumerate(operations) if candidate.same_as(call))
 
     assert position(copies[0]) < position(fill) < position(copies[1])
+    print("[第二部分：验收结果] IR correctness passed; fill range/order/value match")
 
 
 def test_mx_padding_rejects_an_incomplete_physical_scale_group():
     before, _ = _mx_operand_copy("k-contiguous", 96, k_alloc=96)
-    with pytest.raises(tvm.error.InternalError, match="divisible by 64"):
+    print("[场景] MX物理K96不能覆盖完整64元素scale组；预期编译拒绝")
+    print("[第一部分：输入 IR]\n" + before.script())
+    with pytest.raises(tvm.error.InternalError, match="divisible by 64") as error:
         transform.AscendInsertOOBPadding()(before)
+    print(f"[第二部分：验收结果] target physical K constraint rejected / PASS\n{error.value}")
 
 
 @pytest.mark.parametrize("batch_begin", [0, 2, 3, 5])

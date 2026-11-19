@@ -6,6 +6,12 @@
 
 - [逐用例执行指南](EXECUTION_GUIDE.md)：每个单元的三级特性、场景、约束责任、输入输出、执行文件、命令和验收标准。
 - [本轮执行报告](TEST_REPORT.md)：每个单元独立一条实际结果，区分 IR、设备编译、仿真和真机。
+- [main直接执行版报告](DIRECT_MAIN_TEST_REPORT.md)：本次按示例改写后的实际编译、跳过和约束验证结果。
+- [原IR单元测试命令](IR_TEST_COMMANDS.md)：38个原有IR参数场景，以及新增K96负例的准确pytest节点命令。
+
+所有完整DSL用例的 `main()` 都直接调用 `tilelang.compile`。53个数值用例在自己的文件中调用 `make_inputs()`、`ref_program()`，然后执行 `result = kernel(*inputs)`；需要初值或保留GM哨兵时使用 `out_idx=None`，传入 `initial.clone()` 并原地更新结果。最后与CPU参考比较，输出 `max_diff` 和 `correctness passed / 运行结果正确`。pytest与一键入口均调用这个main，不再通过公共硬件执行器运行。
+
+第一部分打印 `program.script()`（输入TIR）、`kernel.get_kernel_source()`（实际编译的AscendC源码）及编译后的设备IR。第二部分输出验收状态。IR局部用例在对应pass边界检查，不作为已初始化的完整数值内核启动。
 
 在仓库根目录一键运行真机验收并生成报告：
 

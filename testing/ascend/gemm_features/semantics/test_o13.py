@@ -16,13 +16,24 @@
 """
 
 import sys
+import re
 from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 import torch
+import tilelang
 import tilelang.ascend.language as T
-from testing.ascend.gemm_features._support import Case, pytest_case, standalone
+from testing.ascend.gemm_features._support import (
+    Case,
+    assert_result,
+    execute,
+    exit_code,
+    parse_options,
+    compiled_ir,
+    record_case,
+    check_signature,
+)
 
 SEED = 20261119
 CASE = Case(
@@ -87,20 +98,97 @@ def matrix(shape, dtype, generator):
     return (torch.randint(-4, 5, shape, generator=generator).float() / 8).to(getattr(torch, dtype))
 
 
-def make_reference():
+def make_inputs():
     gen = torch.Generator().manual_seed(SEED)
     a, b = [matrix((rows, 128), "float8_e4m3fn", gen) for rows in (64, 64)]
     aa, bb = (a.T.contiguous(), b)
     sa, sb = [torch.randint(125, 130, (rows, 128 // 32), generator=gen, dtype=torch.uint8) for rows in (64, 64)]
-    af, bf = [v.float() * torch.exp2(sf.float() - 127).repeat_interleave(32, dim=1)[:, :128] for v, sf in ((a, sa), (b, sb))]
-    expected = af @ bf.T
     inputs = [aa, bb, sa.view(torch.uint16).T.contiguous(), sb.view(torch.uint16).T.contiguous()]
-    return (inputs, expected, None)
+    return (inputs, None)
+
+
+def ref_program(a, b, sa, sb, initial=None):
+    a = a.T
+    sa = sa.T.contiguous().view(torch.uint8)
+    sb = sb.T.contiguous().view(torch.uint8)
+    af = a.float() * torch.exp2(sa.float() - 127).repeat_interleave(32, dim=1)[:, : a.shape[1]]
+    bf = b.float() * torch.exp2(sb.float() - 127).repeat_interleave(32, dim=1)[:, : b.shape[1]]
+    return af @ bf.T
+
+
+def make_reference():
+    inputs, initial = make_inputs()
+    return inputs, ref_program(*inputs, initial=initial), initial
+
+
+def main(config=None):
+    config = config or parse_options(CASE)
+    if config.mode != "hardware":
+        return execute(CASE, make_kernel, make_reference, config)
+    with record_case(CASE, make_kernel, config) as record:
+        record.phase = "reference"
+        inputs, initial = make_inputs()
+        expected = ref_program(*inputs, initial=initial)
+        record.evidence["cpu_reference.pt"] = {"inputs": inputs, "expected": expected, "initial_output": initial}
+        record.phase = "frontend"
+        program = make_kernel()
+        record.evidence["input.tir"] = program.script()
+        print("[第一部分：program.script() / 输入 IR]\n" + program.script(), flush=True)
+        check_signature(program, inputs, expected, initial)
+        acc = initial is not None  # Also pass an explicit output when checking untouched GM sentinels.
+        record.phase = "compile"
+        configs = {tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False} if CASE.manual_schedule else None
+        kernel = tilelang.compile(program, target="ascend", out_idx=None if acc else -1, pass_configs=configs)
+        source = kernel.get_kernel_source()
+        record.evidence["kernel.asc"] = source
+        record.evidence["lowered.tir"] = compiled_ir(kernel, program, CASE)
+        print("[编译后的 AscendC 源码]\n" + source, flush=True)
+        print("[编译后的设备 IR]\n" + record.evidence["lowered.tir"], flush=True)
+        assert re.search(CASE.source_pattern, source), "编译源码未满足本场景的目标断言"
+        record.phase = "execution"
+        try:
+            import torch_npu  # noqa: F401
+        except (ImportError, OSError) as error:
+            record.row.update(status="SKIP", level="HARDWARE", actual="kernel编译通过；NPU运行环境不可用：" + str(error))
+            return record.row
+        if not torch.npu.is_available():
+            record.row.update(status="SKIP", level="HARDWARE", actual="kernel编译通过；NPU不可用，数值尚未验收")
+            return record.row
+        torch.npu.set_device(config.device)
+        device_inputs = [value.npu() for value in inputs]
+        max_error = 0
+        for launch in range(1, CASE.repeats + 1):
+            if acc:
+                result = initial.clone().npu()
+                kernel(*device_inputs, result)
+            else:
+                result = kernel(*device_inputs)
+            torch.npu.synchronize()
+            actual = result.cpu()
+            record.evidence[f"output_{launch}.pt"] = {"actual": actual, "expected": expected}
+            max_diff = (actual.double() - expected.double()).abs().max().item()
+            torch.testing.assert_close(
+                actual,
+                expected,
+                atol=CASE.atol,
+                rtol=CASE.rtol,
+                msg=lambda message, max_diff=max_diff: f"max_diff={max_diff:.8g}, atol={CASE.atol}, rtol={CASE.rtol}\n{message}",
+            )
+            max_error = max(max_error, max_diff)
+            print(f"{CASE.id} ({CASE.scenario}): correctness passed / 运行结果正确; launch={launch}, max_diff={max_diff:.8g}", flush=True)
+        record.row.update(
+            status="PASS",
+            level="HARDWARE",
+            actual="运行结果正确：kernel输出已直接与本文件CPU参考比较",
+            max_abs_error=max_error,
+            launches=CASE.repeats,
+        )
+    return record.row
 
 
 def test_case(gemm_options):
-    pytest_case(CASE, make_kernel, make_reference, gemm_options)
+    assert_result(main(gemm_options))
 
 
 if __name__ == "__main__":
-    raise SystemExit(standalone(CASE, make_kernel, make_reference))
+    raise SystemExit(exit_code(main()))

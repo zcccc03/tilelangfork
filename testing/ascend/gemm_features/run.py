@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from testing.ascend.gemm_features._support import execute, make_options, options  # noqa: E402
+from testing.ascend.gemm_features._support import make_options, options  # noqa: E402
 
 GROUPS = ["scaled_gemm", "data_types", "tails", "semantics"]
 HERE = Path(__file__).resolve().parent
@@ -48,7 +48,8 @@ def report(path, results, selected):
         if result.get("diagnostic"):
             lines = result["diagnostic"].splitlines()
             diagnostic = next((line for line in lines if re.search(case.diagnostic, line, re.IGNORECASE)), lines[-1])
-            actual += "<br>实际诊断：" + diagnostic
+            delimiter = "`" * (max((len(run) for run in re.findall(r"`+", diagnostic)), default=0) + 1)
+            actual += f"<br>实际诊断：{delimiter}{diagnostic}{delimiter}"
         if "max_abs_error" in result:
             actual += f"<br>max_abs_error={result['max_abs_error']}, launches={result['launches']}"
         if result.get("failure_path"):
@@ -143,15 +144,7 @@ def main():
         if module.CASE.kind == "numerical" and config.mode != "compile":
             result = child(module, config, args.timeout)
         else:
-            result = execute(
-                module.CASE,
-                module.make_kernel,
-                module.make_reference,
-                config,
-                getattr(module, "check_ir", None),
-                getattr(module, "check_source", None),
-                getattr(module, "lower_ir", None),
-            )
+            result = module.main(config)
         results.append(result)
         if args.report:
             report(args.report, results, selected[: len(results)])

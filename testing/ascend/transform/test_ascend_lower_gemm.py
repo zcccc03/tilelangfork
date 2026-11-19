@@ -47,8 +47,12 @@ def _lower(m, n, k, *, blockscaled=False):
     target = tvm.target.Target("ascend")
     body = tirx.SBlockRealize([], True, root)
     before = tirx.PrimFunc(tirx.analysis.undefined_vars(body), body).with_attr("target", target)
+    program = tvm.IRModule({"main": before})
+    print("[第一部分：输入 IR]\n" + program.script())
     with target:
-        return transform.AscendLowerTileOp()(tvm.IRModule({"main": before}))
+        after = transform.AscendLowerTileOp()(program)
+    print("[下沉 IR]\n" + after.script())
+    return after
 
 
 @pytest.mark.parametrize("blockscaled", [False, True], ids=["mad", "blockscaled-mad"])
@@ -63,6 +67,7 @@ def test_mad_uses_region_geometry_without_shrinking_storage(blockscaled, symboli
         assert analyzer.can_prove_equal(actual, expected)
     for name in ("a", "b"):
         assert math.prod(int(x) for x in allocated_buffer(after, name).shape) == 64 * 128
+    print(f"[第二部分：验收结果] effective M/N/K ({blockscaled=}, {symbolic=}): IR correctness passed")
 
 
 def _sf_gemm(case):
@@ -110,17 +115,61 @@ def _sf_gemm(case):
     ],
 )
 def test_invalid_binding_and_slice_are_rejected(case, diagnostic):
-    with pytest.raises(tvm.error.InternalError, match=diagnostic):
-        transform.AscendLowerTileOp()(_sf_gemm(case))
+    program = _sf_gemm(case)
+    print(f"[场景] 显式L0 scale校验：{case}; 预期诊断={diagnostic}")
+    print("[第一部分：输入 IR]\n" + program.script())
+    with pytest.raises(tvm.error.InternalError, match=diagnostic) as error:
+        transform.AscendLowerTileOp()(program)
+    print(f"[编译诊断]\n{error.value}\n[第二部分：验收结果] {case}: target constraint rejected / PASS")
 
 
 @pytest.mark.parametrize("case", ["valid", "compact"])
 def test_matching_leading_indices_and_compact_regions(case):
-    after = tl_transform.LowerAccessPtr()(transform.AscendLowerTileOp()(_sf_gemm(case)))
+    program = _sf_gemm(case)
+    print(f"[场景] 显式L0 scale合法同槽/紧凑切片：{case}")
+    print("[第一部分：输入 IR]\n" + program.script())
+    after = tl_transform.LowerAccessPtr()(transform.AscendLowerTileOp()(program))
+    print("[下沉 IR]\n" + after.script())
     (mad,) = calls(after, "tl.ascend_mad_mx")
     analyzer = tvm.arith.Analyzer()
     assert analyzer.can_prove_equal(mad.args[1].args[2], 5 * 32 * 128)
     assert analyzer.can_prove_equal(mad.args[4], 64 if case == "compact" else 128)
+    print(f"[第二部分：验收结果] {case}: IR correctness passed; slot offset and effective K match")
+
+
+def test_blockscaled_effective_k96_with_matching_uint8_scales_is_rejected():
+    """MX K对齐 / T05：仅有效K=96非法；uint8 SF三列准确覆盖96，无需NPU。
+
+    输入：L0A/B物理[32,128]、L0C[32,32]、绑定正确的uint8 SF[32,4]。
+    有效region：A/B K96、SF三列，其余尺寸和起点合法。
+    预期：AscendLowerTileOp拒绝K不是64倍数；不执行数值，不产生数值输出。
+    """
+    a = tirx.decl_buffer((32, 128), "float8_e4m3fn", name="a", scope="shared.l0a")
+    b = tirx.decl_buffer((32, 128), "float8_e4m3fn", name="b", scope="shared.l0b")
+    c = tirx.decl_buffer((32, 32), "float32", name="c", scope="shared.l0c")
+    sa = tirx.decl_buffer((32, 4), "uint8", name="sa", scope="shared.l0a.sf")
+    sb = tirx.decl_buffer((32, 4), "uint8", name="sb", scope="shared.l0b.sf")
+
+    def region(buffer, rows, cols):
+        return tirx.BufferRegion(buffer, [tvm.ir.Range(0, rows), tvm.ir.Range(0, cols)])
+
+    call = T.gemm_blockscaled(
+        region(a, 32, 96), region(b, 32, 96), c, region(sa, 32, 3), region(sb, 32, 3), transpose_B=True, clear_accum=True
+    )
+    program = kernel(
+        tirx.Evaluate(call),
+        buffers=[a, b, c, sa, sb],
+        annotations={
+            "tl.l0_sf_bindings": {sa.data: a.data, sb.data: b.data},
+            "layout_map": {a: make_ascend_major_k_layout(a), b: make_ascend_major_k_layout(b), c: make_ascend_l0c_layout(c)},
+        },
+    )
+    print("[场景] MX有效K96必须拒绝；scale精确覆盖；编译器负责对齐检查")
+    print("[第一部分：输入 IR]\n" + program.script())
+    with pytest.raises(tvm.error.InternalError, match=r"K.*(?:divisible|multiple).*64") as error:
+        after = transform.AscendLowerTileOp()(program)
+        print("[未拒绝时的实际下沉 IR]\n" + after.script())
+    print(f"[第二部分：验收结果] target K alignment rejected / PASS\n{error.value}")
 
 
 def test_mismatched_sf_binding_fails_before_layout_inference():

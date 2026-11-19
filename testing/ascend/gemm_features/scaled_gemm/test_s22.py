@@ -20,8 +20,9 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+import tilelang
 import tilelang.ascend.language as T
-from testing.ascend.gemm_features._support import Case, pytest_case, standalone
+from testing.ascend.gemm_features._support import Case, assert_result, exit_code, parse_options, compiled_ir, record_case
 
 SEED = 20261119
 CASE = Case(
@@ -61,9 +62,28 @@ def make_reference():
     return None
 
 
+def main(config=None):
+    config = config or parse_options(CASE)
+    with record_case(CASE, make_kernel, config) as record:
+        record.phase = "frontend"
+        program = make_kernel()
+        record.evidence["input.tir"] = program.script()
+        print("[第一部分：program.script() / 输入 IR]\n" + program.script(), flush=True)
+        record.phase = "compile"
+        configs = {tilelang.PassConfigKey.TL_ENABLE_AUTO_SCHEDULE: False} if CASE.manual_schedule else None
+        kernel = tilelang.compile(program, target="ascend", out_idx=None, pass_configs=configs)
+        source = kernel.get_kernel_source()
+        record.evidence["kernel.asc"] = source
+        record.evidence["lowered.tir"] = compiled_ir(kernel, program, CASE)
+        print("[编译后的 AscendC 源码]\n" + source, flush=True)
+        print("[编译后的设备 IR]\n" + record.evidence["lowered.tir"], flush=True)
+        raise AssertionError("目标非法输入被 tilelang.compile 接受；预期约束没有拦截")
+    return record.row
+
+
 def test_case(gemm_options):
-    pytest_case(CASE, make_kernel, make_reference, gemm_options)
+    assert_result(main(gemm_options))
 
 
 if __name__ == "__main__":
-    raise SystemExit(standalone(CASE, make_kernel, make_reference))
+    raise SystemExit(exit_code(main()))

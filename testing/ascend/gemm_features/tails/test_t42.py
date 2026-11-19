@@ -25,7 +25,8 @@ from tilelang import tvm
 from tilelang.ascend import transform
 from tvm import tirx
 from tilelang.layout import make_ascend_major_k_layout
-from testing.ascend.gemm_features._support import Case, pytest_case, standalone
+from testing.ascend.gemm_features._support import Case, assert_result, exit_code, parse_options
+from testing.ascend.gemm_features._support import execute
 
 SEED = 20261119
 CASE = Case(
@@ -96,9 +97,14 @@ def lower_ir(module):
     return transform.AscendInsertOOBPadding()(module)
 
 
+def main(config=None):
+    config = config or parse_options(CASE)
+    return execute(CASE, make_kernel, make_reference, config, lower_ir=lower_ir)
+
+
 def test_case(gemm_options):
-    pytest_case(CASE, make_kernel, make_reference, gemm_options, lower_ir=lower_ir)
+    assert_result(main(gemm_options))
 
 
 if __name__ == "__main__":
-    raise SystemExit(standalone(CASE, make_kernel, make_reference, lower_ir=lower_ir))
+    raise SystemExit(exit_code(main()))

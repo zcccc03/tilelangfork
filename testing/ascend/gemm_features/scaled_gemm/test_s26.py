@@ -25,7 +25,8 @@ from tilelang import tvm
 from tvm import tirx
 from tilelang.layout import make_ascend_major_k_layout, make_ascend_l0c_layout
 from testing.ascend._ir import calls
-from testing.ascend.gemm_features._support import Case, pytest_case, standalone
+from testing.ascend.gemm_features._support import Case, assert_result, exit_code, parse_options
+from testing.ascend.gemm_features._support import execute
 
 SEED = 20261119
 CASE = Case(
@@ -102,9 +103,14 @@ def check_ir(module):
     assert analyzer.can_prove_equal(mad.args[1].args[2], 5 * 32 * 128)
 
 
+def main(config=None):
+    config = config or parse_options(CASE)
+    return execute(CASE, make_kernel, make_reference, config, check_ir=check_ir)
+
+
 def test_case(gemm_options):
-    pytest_case(CASE, make_kernel, make_reference, gemm_options, check_ir=check_ir)
+    assert_result(main(gemm_options))
 
 
 if __name__ == "__main__":
-    raise SystemExit(standalone(CASE, make_kernel, make_reference, check_ir=check_ir))
+    raise SystemExit(exit_code(main()))
