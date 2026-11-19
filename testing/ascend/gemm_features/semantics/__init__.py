@@ -1,0 +1,1 @@
+"""Independent single-scenario cases."""
