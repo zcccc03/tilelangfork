@@ -1,7 +1,5 @@
 # T.gemm
 
-适用范围：Ascend 950，AscendC 后端，编译目标为 `target="ascend"`。使用 `from tilelang.ascend import language as T` 导入接口。
-
 ## OP 概述
 
 `T.gemm` 计算两个矩阵的乘积，并将结果写入 L0C 中的 C。它可以从零开始计算，也可以在 C 的已有结果上继续累加。

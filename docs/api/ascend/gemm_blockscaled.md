@@ -1,7 +1,5 @@
 # T.gemm_blockscaled
 
-适用范围：Ascend 950，AscendC 后端，编译目标为 `target="ascend"`。使用 `from tilelang.ascend import language as T` 导入接口。
-
 ## OP 概述
 
 `T.gemm_blockscaled` 计算带分组缩放系数的矩阵乘法，将结果写入 L0C 中的 C，并使用 FP32 累加。A、B 各沿 K 方向每 32 个元素使用一个 E8M0 scale，分别由 SFA、SFB 提供。
